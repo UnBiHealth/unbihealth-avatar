@@ -139,6 +139,36 @@ public class AvatarSkeleton implements Skeleton {
         return sensors.get(sensorId);
     }
 
+    /**
+     * Associates a bone, given its id, with given sensor id.
+     *
+     * @param boneId   The id of the bone to be associated.
+     * @param sensorId The new sensor id to use.
+     * @return The previous sensor id associated to the bone.
+     * @throws NullPointerException     If either boneId or sensorId is null.
+     * @throws IllegalArgumentException If bone is unknown, the sensor id is invalid or it's being used by a different
+     *                                  bone.
+     */
+    public String setSensorId(String boneId, String sensorId) {
+        if (boneId == null)
+            throw new NullPointerException("bone id");
+        if (sensorId == null)
+            throw new NullPointerException("sensor id");
+        if (StringUtils.isEmpty(sensorId))
+            throw new NullPointerException("invalid sensor id");
+
+        AvatarBone b = getBone(boneId);
+        if (b == null)
+            throw new IllegalArgumentException("Unknown bone id.");
+        AvatarBone used = getBoneBySensorId(sensorId);
+        if ((used != null) && (used != b))
+            throw new IllegalArgumentException("Sensor id already in use by bone '" + used.getId() + "'.");
+        String previous = b.getSensorId();
+        b.setSensorId(sensorId);
+        sensors.put(sensorId, b);
+        return previous;
+    }
+
     @Override
     public boolean equals(Object obj) {
         if (obj == this)

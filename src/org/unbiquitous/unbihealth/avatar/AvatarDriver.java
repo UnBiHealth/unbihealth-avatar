@@ -1,5 +1,6 @@
 package org.unbiquitous.unbihealth.avatar;
 
+import com.fasterxml.jackson.databind.JavaType;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.unbiquitous.unbihealth.avatar.data.AvatarBone;
 import org.unbiquitous.unbihealth.avatar.data.AvatarSkeleton;
@@ -9,11 +10,10 @@ import org.unbiquitous.uos.core.InitialProperties;
 import org.unbiquitous.uos.core.UOSLogging;
 import org.unbiquitous.uos.core.adaptabitilyEngine.Gateway;
 import org.unbiquitous.uos.core.adaptabitilyEngine.NotifyException;
-import org.unbiquitous.uos.core.adaptabitilyEngine.SmartSpaceGateway;
+import org.unbiquitous.uos.core.adaptabitilyEngine.ServiceCallException;
 import org.unbiquitous.uos.core.adaptabitilyEngine.UosEventListener;
 import org.unbiquitous.uos.core.applicationManager.CallContext;
-import org.unbiquitous.uos.core.deviceManager.DeviceListener;
-import org.unbiquitous.uos.core.deviceManager.DeviceManager;
+import org.unbiquitous.uos.core.driverManager.DriverData;
 import org.unbiquitous.uos.core.driverManager.UosDriver;
 import org.unbiquitous.uos.core.driverManager.UosEventDriver;
 import org.unbiquitous.uos.core.messageEngine.dataType.UpDevice;
@@ -26,7 +26,7 @@ import org.unbiquitous.uos.core.messageEngine.messages.Response;
 import org.unbiquitous.uos.core.network.model.NetworkDevice;
 
 import java.io.IOException;
-import java.util.List;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -36,7 +36,7 @@ import java.util.logging.Logger;
  *
  * @author Luciano Santos
  */
-public class AvatarDriver implements UosEventDriver, DeviceListener, UosEventListener {
+public class AvatarDriver implements UosEventDriver, UosEventListener {
     public static final String DRIVER_NAME = "org.unbiquitous.ubihealth.AvatarDriver";
     public static final String CHANGE_EVENT_NAME = "change";
     public static final String CHANGE_NEW_DATA_PARAM_NAME = "newData";
@@ -45,16 +45,18 @@ public class AvatarDriver implements UosEventDriver, DeviceListener, UosEventLis
 
     private static final UpDriver _driver = new UpDriver(DRIVER_NAME) {
         {
-            addEvent(CHANGE_EVENT_NAME).addParameter(CHANGE_NEW_DATA_PARAM_NAME, UpService.ParameterType.MANDATORY);
+            addEvent(CHANGE_EVENT_NAME)
+                    .addParameter(CHANGE_NEW_DATA_PARAM_NAME, UpService.ParameterType.MANDATORY);
         }
     };
     private static Logger logger = UOSLogging.getLogger();
     private static ObjectMapper mapper = new ObjectMapper();
 
     private Gateway gateway;
-    private DeviceManager deviceManager;
     private String instanceId;
-    private ConcurrentHashMap<UpNetworkInterface, UpDevice> listeners = new ConcurrentHashMap<UpNetworkInterface, UpDevice>();
+    private Map<UpNetworkInterface, UpDevice> listeners = new ConcurrentHashMap<UpNetworkInterface, UpDevice>();
+    private Map<DriverData, Set<String>> driverToSensor = new HashMap<>();
+    private Map<String, DriverData> sensorToDriver = new HashMap<>();
     private AvatarSkeleton skeleton;
 
     public String getInstanceId() {
@@ -63,6 +65,87 @@ public class AvatarDriver implements UosEventDriver, DeviceListener, UosEventLis
 
     public Skeleton getSkeleton() {
         return skeleton;
+    }
+
+    /**
+     * Associates a bone, given its id, with given sensor id.
+     * <p>
+     * If {@link DriverData} is provided, tries to register to listen to it.
+     *
+     * @param boneId   The id of the bone to be associated.
+     * @param sensorId The new sensor id to use.
+     * @param driver   The driver data to use, or null, if no driver should be listened to.
+     * @throws NullPointerException     If either boneId or sensorId is null.
+     * @throws IllegalArgumentException If bone is unknown, the sensor id is invalid or it's being used by a different
+     *                                  bone.
+     */
+    public synchronized void setSensor(String boneId, String sensorId, DriverData driver) throws ServiceCallException, IOException, NotifyException {
+        // Update local reference
+        String previous = skeleton.setSensorId(boneId, sensorId);
+
+        // Must I register for remote events?
+        if (driver != null) {
+            try {
+                // Validate driver data.
+                if (!IMUDriver.getDriverStatic().equals(driver.getDriver()))
+                    throw new IllegalArgumentException("Driver is not IMUDriver.");
+                driver = new DriverData(IMUDriver.getDriverStatic(), driver.getDevice(), driver.getInstanceID());
+
+                // Retrieves acceptable sensor id list.
+                Response response = gateway.callService(driver.getDevice(), IMUDriver.LIST_IDS_NAME, IMUDriver.DRIVER_NAME, driver.getInstanceID(), null, null);
+                Object idsObj = response.getResponseData(IMUDriver.IDS_PARAM_NAME);
+                if (idsObj == null)
+                    throw new ServiceCallException("Failed to retrieve sensor id list from device.");
+                JavaType listType = mapper.getTypeFactory().constructParametrizedType(List.class, List.class, String.class);
+                List<String> ids = (idsObj instanceof String) ? mapper.readValue((String) idsObj, listType) : mapper.convertValue(idsObj, listType);
+                if (!ids.contains(sensorId))
+                    throw new IllegalArgumentException("Unknown sensor id for target device.");
+
+                // Is there any driver associated to this sensor id?
+                DriverData sensorDriver = sensorToDriver.get(sensorId);
+                if (sensorDriver != null) {
+                    // If it's the same driver, return.
+                    if (sensorDriver.equals(driver))
+                        return;
+                    // If it's a different driver, first dissociates it.
+                    removeSensorDriver(sensorId, sensorDriver);
+                }
+
+                // Must I call register?
+                Set<String> driverSensors = driverToSensor.get(driver);
+                if (driverSensors == null) {
+                    gateway.register(this, driver.getDevice(), IMUDriver.DRIVER_NAME, IMUDriver.CHANGE_EVENT_NAME);
+                    driverSensors = new HashSet<>();
+                }
+                driverSensors.add(sensorId);
+                driverToSensor.put(driver, driverSensors);
+                sensorToDriver.put(sensorId, driver);
+            } catch (Throwable t) {
+                skeleton.setSensorId(boneId, previous);
+                throw t;
+            }
+        }
+
+        // If necessary, unregisters the previous sensor id.
+        if (!previous.equals(sensorId)) {
+            DriverData sensorDriver = sensorToDriver.get(previous);
+            if (sensorDriver != null)
+                removeSensorDriver(previous, sensorDriver);
+        }
+    }
+
+    private void removeSensorDriver(String sensorId, DriverData sensorDriver) {
+        sensorToDriver.remove(sensorId);
+        Set<String> driverSensors = driverToSensor.get(sensorDriver);
+        driverSensors.remove(sensorId);
+        if (driverSensors.isEmpty()) {
+            try {
+                gateway.unregister(this, sensorDriver.getDevice(), IMUDriver.DRIVER_NAME, sensorDriver.getInstanceID(), IMUDriver.CHANGE_EVENT_NAME);
+            } catch (Throwable t) {
+                logger.log(Level.WARNING, "Failed to unregister to IMUDriver.", t);
+            }
+            driverToSensor.remove(sensorDriver);
+        }
     }
 
     @Override
@@ -93,21 +176,12 @@ public class AvatarDriver implements UosEventDriver, DeviceListener, UosEventLis
             throw new RuntimeException(e);
         }
 
-        try {
-            deviceManager = ((SmartSpaceGateway) gateway).getDeviceManager();
-            deviceManager.addDeviceListener(this);
-        } catch (ClassCastException e) {
-            logger.log(Level.SEVERE, DRIVER_NAME + ": a SmartSpaceGateway is expected.", e);
-            throw e;
-        }
-
         logger.info(DRIVER_NAME + ": init instance [" + id + "].");
     }
 
     @Override
     public void destroy() {
         listeners.clear();
-        deviceManager.removeDeviceListener(this);
         logger.info(DRIVER_NAME + ": destroy instance [" + instanceId + "]. Bye!");
     }
 
@@ -135,16 +209,6 @@ public class AvatarDriver implements UosEventDriver, DeviceListener, UosEventLis
         NetworkDevice networkDevice = context.getCallerNetworkDevice();
         String host = networkDevice.getNetworkDeviceName().split(":")[1];
         return new UpNetworkInterface(networkDevice.getNetworkDeviceType(), host);
-    }
-
-    @Override
-    public void deviceRegistered(UpDevice device) {
-
-    }
-
-    @Override
-    public void deviceUnregistered(UpDevice device) {
-
     }
 
     @Override

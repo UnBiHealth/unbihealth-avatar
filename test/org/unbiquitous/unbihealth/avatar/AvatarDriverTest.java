@@ -10,14 +10,18 @@ import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.ExpectedException;
 import org.unbiquitous.unbihealth.avatar.data.AvatarBone;
+import org.unbiquitous.unbihealth.avatar.data.AvatarSkeleton;
 import org.unbiquitous.unbihealth.avatar.data.BoneData;
 import org.unbiquitous.unbihealth.imu.IMUDriver;
 import org.unbiquitous.unbihealth.imu.SensorData;
 import org.unbiquitous.uos.core.InitialProperties;
+import org.unbiquitous.uos.core.adaptabitilyEngine.ServiceCallException;
 import org.unbiquitous.uos.core.adaptabitilyEngine.SmartSpaceGateway;
 import org.unbiquitous.uos.core.deviceManager.DeviceManager;
+import org.unbiquitous.uos.core.driverManager.DriverData;
 import org.unbiquitous.uos.core.messageEngine.dataType.UpService;
 import org.unbiquitous.uos.core.messageEngine.messages.Notify;
+import org.unbiquitous.uos.core.messageEngine.messages.Response;
 
 import java.io.IOException;
 import java.util.*;
@@ -39,6 +43,7 @@ public class AvatarDriverTest {
     DeviceManager deviceManager;
     AvatarDriver instance;
     InitialProperties props;
+    DriverData imuDriverData;
 
     @Rule
     public ExpectedException expectEx = ExpectedException.none();
@@ -50,6 +55,7 @@ public class AvatarDriverTest {
         when(gateway.getDeviceManager()).thenReturn(deviceManager);
         instance = new AvatarDriver();
         props = new InitialProperties();
+        imuDriverData = new DriverData(IMUDriver.getDriverStatic(), null, null);
     }
 
     @Test
@@ -247,6 +253,129 @@ public class AvatarDriverTest {
         assertThat(s.getBone("n")).isNull();
     }
 
+    @Test
+    public void listenShouldThrowOnNullBoneId() throws Exception {
+        expectEx.expect(NullPointerException.class);
+        expectEx.expectMessage("bone id");
+        instance.init(gateway, props, null);
+        instance.setSensor(null, null, null);
+    }
+
+    @Test
+    public void listenShouldThrowOnUnknownBoneId() throws Exception {
+        expectEx.expect(IllegalArgumentException.class);
+        expectEx.expectMessage("Unknown bone id");
+        instance.init(gateway, props, null);
+        instance.setSensor("unknown", "sensor", null);
+    }
+
+    @Test
+    public void listenShouldThrowOnNullSensorId() throws Exception {
+        expectEx.expect(NullPointerException.class);
+        expectEx.expectMessage("sensor id");
+        instance.init(gateway, props, null);
+        instance.setSensor("root", null, null);
+    }
+
+    @Test
+    public void listenShouldThrowOnAlreadyUsedSensorId() throws Exception {
+        expectEx.expect(IllegalArgumentException.class);
+        expectEx.expectMessage("already in use by bone 'ab0'");
+        props.put("avatardriver.skeleton", createComplexHierarchyJSON());
+        instance.init(gateway, props, null);
+        instance.setSensor("a", "ab0-sensor", null);
+    }
+
+    @Test
+    public void listenShouldNotThrownOnSameBoneUsingSensorId() throws Exception {
+        props.put("avatardriver.skeleton", createComplexHierarchyJSON());
+        instance.init(gateway, props, null);
+        instance.setSensor("ab0", "ab0-sensor", null);
+        AvatarSkeleton skeleton = (AvatarSkeleton) instance.getSkeleton();
+        assertThat(skeleton.getBone("ab0")).isEqualTo(skeleton.getBoneBySensorId("ab0-sensor"));
+    }
+
+    @Test
+    public void listenShouldThrowOnNotIMUDriver() throws Exception {
+        expectEx.expect(IllegalArgumentException.class);
+        expectEx.expectMessage("not IMUDriver");
+        instance.init(gateway, props, null);
+        instance.setSensor("root", "root", mock(DriverData.class));
+    }
+
+    @Test
+    public void listenShouldThrowOnInvalidResponse() throws Exception {
+        when(gateway.callService(null, IMUDriver.LIST_IDS_NAME, IMUDriver.DRIVER_NAME, null, null, null))
+                .thenReturn(new Response());
+        expectEx.expect(ServiceCallException.class);
+        expectEx.expectMessage("sensor id list");
+        instance.init(gateway, props, null);
+        instance.setSensor("root", "sensor", imuDriverData);
+    }
+
+    @Test
+    public void listenShouldThrowOnUnknownSensorId() throws Exception {
+        when(gateway.callService(null, IMUDriver.LIST_IDS_NAME, IMUDriver.DRIVER_NAME, null, null, null))
+                .thenReturn(new Response().addParameter(IMUDriver.IDS_PARAM_NAME, new String[]{"sensor"}));
+        expectEx.expect(IllegalArgumentException.class);
+        expectEx.expectMessage("Unknown sensor");
+        instance.init(gateway, props, null);
+        instance.setSensor("root", "unknown", imuDriverData);
+    }
+
+    @Test
+    public void shouldRegisterKnownSensor() throws Exception {
+        when(gateway.callService(null, IMUDriver.LIST_IDS_NAME, IMUDriver.DRIVER_NAME, null, null, null))
+                .thenReturn(new Response().addParameter(IMUDriver.IDS_PARAM_NAME, new String[]{"sensor"}));
+        instance.init(gateway, props, null);
+        instance.setSensor("root", "sensor", imuDriverData);
+        verify(gateway, times(1)).register(instance, null, IMUDriver.DRIVER_NAME, IMUDriver.CHANGE_EVENT_NAME);
+    }
+
+    @Test
+    public void shouldUnregisterWhenNoSensorIsAssociatedAnymore() throws Exception {
+        DriverData driver1 = new DriverData(IMUDriver.getDriverStatic(), null, "driver1");
+        DriverData driver2 = new DriverData(IMUDriver.getDriverStatic(), null, "driver2");
+        when(gateway.callService(null, IMUDriver.LIST_IDS_NAME, IMUDriver.DRIVER_NAME, "driver1", null, null))
+                .thenReturn(new Response().addParameter(IMUDriver.IDS_PARAM_NAME, new String[]{"sensor1"}));
+        when(gateway.callService(null, IMUDriver.LIST_IDS_NAME, IMUDriver.DRIVER_NAME, "driver2", null, null))
+                .thenReturn(new Response().addParameter(IMUDriver.IDS_PARAM_NAME, new String[]{"sensor2", "sensor3"}));
+        props.put("avatardriver.skeleton", createComplexHierarchyJSON());
+        instance.init(gateway, props, null);
+        instance.setSensor("a", "sensor1", driver1);
+        instance.setSensor("ab0", "sensor2", driver2);
+        instance.setSensor("ab1", "sensor3", driver2);
+        instance.setSensor("ab0", "ab0-sensor", null);
+        instance.setSensor("ab1", "ab1-sensor", null);
+        verify(gateway, times(2)).register(instance, null, IMUDriver.DRIVER_NAME, IMUDriver.CHANGE_EVENT_NAME);
+        verify(gateway, times(1)).unregister(instance, null, IMUDriver.DRIVER_NAME, "driver2", IMUDriver.CHANGE_EVENT_NAME);
+    }
+
+    @Test
+    public void shouldUpdateBonesValues() throws Exception {
+        BoneData[] bones = new BoneData[]{new BoneData("arm", "1"), new BoneData("forearm", "2", "arm")};
+        props.put("avatardriver.skeleton", mapper.writeValueAsString(bones));
+        instance.init(gateway, props, null);
+        instance.handleEvent(createNotify("1", angleAxis(Vector3D.PLUS_I, FastMath.PI / 4)));
+        assertThat(instance.getSkeleton().getBone("arm").getRotation()).isEqualTo(angleAxis(Vector3D.PLUS_I, FastMath.PI / 4));
+        instance.handleEvent(createNotify("2", angleAxis(Vector3D.PLUS_I, FastMath.PI / 2)));
+        assertTrue(instance.getSkeleton().getBone("forearm").getRotation().equals(angleAxis(Vector3D.PLUS_I, FastMath.PI / 4), EPSILON));
+    }
+
+    private static Quaternion angleAxis(Vector3D axis, double angle) {
+        Rotation rot = new Rotation(axis, angle);
+        return new Quaternion(rot.getQ0(), rot.getQ1(), rot.getQ2(), rot.getQ3());
+    }
+
+    private static Notify createNotify(String sensor, Quaternion value) {
+        SensorData sensorData = new SensorData();
+        sensorData.setId(sensor);
+        sensorData.setQuaternion(value);
+        sensorData.setTimestamp(System.currentTimeMillis());
+        return new Notify(IMUDriver.CHANGE_EVENT_NAME, IMUDriver.DRIVER_NAME)
+                .addParameter(IMUDriver.CHANGE_NEW_DATA_PARAM_NAME, sensorData);
+    }
+
     private static String createComplexHierarchyJSON() throws IOException {
         List<BoneData> bones = new ArrayList<>();
         bones.add(new BoneData("a", "a-sensor"));
@@ -318,44 +447,5 @@ public class AvatarDriverTest {
                 "  ab0:ab0-sensor\n" +
                 "}";
         return result;
-    }
-
-    @Test
-    public void shouldRegisterToListenForNewcomers() throws Exception {
-        instance.init(gateway, props, null);
-        verify(deviceManager).addDeviceListener(instance);
-    }
-
-    @Test
-    public void shouldUnregisterOnDestroy() throws Exception {
-        instance.init(gateway, props, null);
-        verify(deviceManager).addDeviceListener(instance);
-        instance.destroy();
-        verify(deviceManager).removeDeviceListener(instance);
-    }
-
-    @Test
-    public void shouldUpdateBonesValues() throws Exception {
-        BoneData[] bones = new BoneData[]{new BoneData("arm", "1"), new BoneData("forearm", "2", "arm")};
-        props.put("avatardriver.skeleton", mapper.writeValueAsString(bones));
-        instance.init(gateway, props, null);
-        instance.handleEvent(createNotify("1", angleAxis(Vector3D.PLUS_I, FastMath.PI / 4)));
-        assertThat(instance.getSkeleton().getBone("arm").getRotation()).isEqualTo(angleAxis(Vector3D.PLUS_I, FastMath.PI / 4));
-        instance.handleEvent(createNotify("2", angleAxis(Vector3D.PLUS_I, FastMath.PI / 2)));
-        assertTrue(instance.getSkeleton().getBone("forearm").getRotation().equals(angleAxis(Vector3D.PLUS_I, FastMath.PI / 4), EPSILON));
-    }
-
-    private static Quaternion angleAxis(Vector3D axis, double angle) {
-        Rotation rot = new Rotation(axis, angle);
-        return new Quaternion(rot.getQ0(), rot.getQ1(), rot.getQ2(), rot.getQ3());
-    }
-
-    private static Notify createNotify(String sensor, Quaternion value) {
-        SensorData sensorData = new SensorData();
-        sensorData.setId(sensor);
-        sensorData.setQuaternion(value);
-        sensorData.setTimestamp(System.currentTimeMillis());
-        return new Notify(IMUDriver.CHANGE_EVENT_NAME, IMUDriver.DRIVER_NAME)
-                .addParameter(IMUDriver.CHANGE_NEW_DATA_PARAM_NAME, sensorData);
     }
 }
